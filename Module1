@@ -1,0 +1,2161 @@
+Option Explicit
+Private Const RESULTS_HEADER_ROW As Long = 22   ' ligne où commence la table ("Individu" + odeurs)
+Option Private Module  ' évite les collisions entre modules
+
+'========================
+' PARAMÈTRES DOSSIERS
+'========================
+Private Const DATA_SUBFOLDER As String = "data"      ' dossier des .csv de mesure
+Private Const STIM_SUBFOLDER As String = "stimlist"  ' dossier des stimlists
+
+'========================
+' UTILS DOSSIERS / FICHIERS
+'========================
+Private Function GetRootFolder() As String
+    If Len(ThisWorkbook.Path) = 0 Then
+        MsgBox "Enregistre d'abord ce classeur (.xlsm) dans ton dossier de travail.", vbExclamation
+        GetRootFolder = ""
+    Else
+        GetRootFolder = ThisWorkbook.Path & Application.PathSeparator
+    End If
+End Function
+
+Private Function JoinPath(a As String, b As String) As String
+    If Right$(a, 1) = Application.PathSeparator Then
+        JoinPath = a & b
+    Else
+        JoinPath = a & Application.PathSeparator & b
+    End If
+End Function
+
+Private Function FolderExists(ByVal p As String) As Boolean
+    On Error Resume Next
+    FolderExists = (GetAttr(p) And vbDirectory) = vbDirectory
+    On Error GoTo 0
+End Function
+
+Private Function SheetExists(ByVal name As String) As Boolean
+    On Error Resume Next
+    SheetExists = Not Worksheets(name) Is Nothing
+    On Error GoTo 0
+End Function
+
+Private Function CleanSheetName(ByVal s As String) As String
+    Dim badChars As Variant, c As Variant
+    badChars = Array(":", "\", "/", "?", "*", "[", "]")
+    For Each c In badChars
+        s = Replace(s, c, " ")
+    Next
+    s = Replace(s, vbCr, " ")
+    s = Replace(s, vbLf, " ")
+    s = Trim$(s)
+    If Len(s) = 0 Then s = "Feuille"
+    If Len(s) > 31 Then s = Left$(s, 31)
+    CleanSheetName = s
+End Function
+Private Function IsDataSheet(ws As Worksheet) As Boolean
+    Dim n As String: n = ws.name
+    IsDataSheet = (ws.name <> "TABLEAU_DE_BORD" And ws.name <> "LOG" And ws.name <> "PALETTE" _
+                   And Left$(n, 5) <> "PLOT_" And LCase$(CStr(ws.Cells(1, 1).Value)) = "time")
+End Function
+
+Private Function XNameOf(ByVal base As String) As String
+    Dim nm As String
+    nm = "x" & base
+    If Len(nm) > 31 Then nm = Left$(nm, 31)
+    XNameOf = nm
+End Function
+Private Function GetBaseName(ByVal fileName As String) As String
+    Dim p As Long: p = InStrRev(fileName, ".")
+    If p > 0 Then GetBaseName = Left$(fileName, p - 1) Else GetBaseName = fileName
+End Function
+
+'========================
+' LOG
+'========================
+Private Sub LogMsg(ByVal msg As String)
+    Dim ws As Worksheet
+    If Not SheetExists("LOG") Then
+        Set ws = Worksheets.Add(After:=Worksheets(Worksheets.Count))
+        ws.name = "LOG"
+        ws.Range("A1:B1").Value = Array("Horodatage", "Message")
+        ws.Rows(1).Font.Bold = True
+    Else
+        Set ws = Worksheets("LOG")
+    End If
+    
+    Dim r As Long
+    r = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
+    ws.Cells(r, 1).Value = Now
+    ws.Cells(r, 2).Value = msg
+End Sub
+
+'========================
+' LECTURE ROBUSTE UTF-16/UTF-8/ANSI
+'========================
+Private Function ReadFileAllTextSmart(ByVal fullPath As String) As String
+    Dim tryCharsets As Variant, cs As Variant
+    Dim stm As Object, txt As String
+    tryCharsets = Array("utf-16", "unicode", "utf-8", "windows-1252")
+    
+    On Error GoTo fail
+    For Each cs In tryCharsets
+        Set stm = CreateObject("ADODB.Stream")
+        With stm
+            .Type = 2
+            .Charset = cs
+            .Open
+            .LoadFromFile fullPath
+            txt = .ReadText(-1)
+            .Close
+        End With
+        If InStr(1, LCase$(txt), "rec") > 0 Or InStr(1, LCase$(txt), "value") > 0 Then
+            ReadFileAllTextSmart = txt
+            Exit Function
+        End If
+    Next cs
+    ReadFileAllTextSmart = txt
+    Exit Function
+fail:
+    On Error Resume Next
+    If Not stm Is Nothing Then stm.Close
+    ReadFileAllTextSmart = ""
+End Function
+
+Private Function SplitToLines(ByVal text As String) As Variant
+    Dim t As String
+    t = Replace(text, vbCrLf, vbLf)
+    t = Replace(t, vbCr, vbLf)
+    t = Replace(t, ChrW(&HFEFF), "")
+    SplitToLines = Split(t, vbLf)
+End Function
+
+Private Function NormalizeLine(ByVal s As String) As String
+    s = Replace(s, Chr(160), "")
+    s = Replace(s, vbTab, ";")
+    s = Replace(s, "–", "-")
+    s = Replace(s, "—", "-")
+    s = Trim$(s)
+    NormalizeLine = s
+End Function
+
+Private Function SplitFields(ByVal line As String) As Variant
+    SplitFields = Split(NormalizeLine(line), ";")
+End Function
+
+Private Function IsRecHeader(ByVal line As String) As Boolean
+    Dim L As String
+    L = LCase$(Trim$(NormalizeLine(line)))
+    IsRecHeader = (Left$(L, 3) = "rec")
+End Function
+
+'========================
+' CONVERSION NUMÉRIQUE FR — robuste
+'========================
+Private Function ToNumber(ByVal s As String) As Double
+    ' Objectif : lire des nombres au format CSV FR "1 234,56"
+    '            même avec guillemets, espaces insécables, ou signe moins unicode.
+    Dim t As String
+    t = Trim$(s)
+    If t = "" Then
+        ToNumber = 0#
+        Exit Function
+    End If
+    
+    ' Nettoyage des caractères parasites fréquents
+    t = Replace(t, """", "")             ' guillemets
+    t = Replace(t, Chr(160), "")         ' NBSP
+    t = Replace(t, ChrW(&H202F), "")     ' narrow no-break space
+    t = Replace(t, ChrW(&H2009), "")     ' thin space
+    t = Replace(t, vbTab, "")            ' tab
+    t = Replace(t, " ", "")              ' espaces classiques
+    
+    ' Normalise le signe moins (peut être U+2212 ou tirets typographiques)
+    t = Replace(t, ChrW(&H2212), "-")    ' minus sign -
+    t = Replace(t, "–", "-")             ' en dash
+    t = Replace(t, "—", "-")             ' em dash
+    
+    ' Virgule décimale FR -> point (Val lit toujours le point)
+    t = Replace(t, ",", ".")
+    
+    ' Conversion indépendante de la locale
+    ToNumber = val(t)
+End Function
+
+
+'========================
+' TABLEAU DE BORD (7 boutons)
+'========================
+Private Sub SetGridlinesVisible(ByVal visible As Boolean)
+    On Error Resume Next
+    If Not Application.ActiveWindow Is Nothing Then
+        Application.ActiveWindow.DisplayGridlines = visible
+    End If
+    On Error GoTo 0
+End Sub
+
+Public Sub setupdashboard()
+    Dim ws As Worksheet, shp As Shape, s As Shape
+    Dim leftPos As Double, leftPosR As Double, topStart As Double, w As Double, h As Double, gap As Double
+    
+    Application.ScreenUpdating = False
+
+    ' (re)crée le dashboard
+    If SheetExists("TABLEAU_DE_BORD") Then
+        Set ws = Worksheets("TABLEAU_DE_BORD")
+        ws.Cells.Clear
+        For Each s In ws.Shapes: s.Delete: Next
+    Else
+        Set ws = Worksheets.Add(Before:=Worksheets(1))
+        ws.name = "TABLEAU_DE_BORD"
+    End If
+
+    ' fond & style global
+    With ws
+        .Cells.Interior.Color = RGB(50, 50, 50)
+        .Cells.Font.name = "Calibri Light"
+        .Cells.Font.Color = RGB(255, 255, 255)
+        .Cells.Font.Size = 11
+        .Cells.ColumnWidth = 42
+        .Cells.RowHeight = 18
+        .Activate
+    End With
+    SetGridlinesVisible False
+
+    ' titre
+    ws.Range("A1").Value = "CENTRE DE COMMANDES"
+    With ws.Range("A1")
+        .Font.Bold = True
+        .Font.Size = 18
+        .Font.Color = RGB(255, 255, 255)
+    End With
+
+    ' ========== LAYOUT ==========
+    leftPos = 30                 ' colonne gauche
+    w = 320: h = 54              ' taille bouton
+    gap = 14                     ' espace vertical entre rangées (réduit)
+    topStart = 80                ' point de départ plus haut
+    leftPosR = leftPos + w + 60  ' colonne droite (suppression)
+
+    ' petite fonction locale pour calculer la hauteur de rangée
+    Dim TopOf As Object: Set TopOf = CreateObject("Scripting.Dictionary")
+    ' row 0: Collecter / Supprimer global
+    ' row 1: Convertir
+    ' row 2: Dupliquer / Supprimer x
+    ' row 3: Moyenne réplicats
+    ' row 4: Ordonner colonnes
+    ' row 5: Courbes par individu / Supprimer PLOT_*
+    ' row 6: Mini-graphs / Supprimer PLOTS_X_GRID
+    Dim r As Long
+    For r = 0 To 6
+        TopOf(CStr(r)) = topStart + r * (h + gap)
+    Next r
+
+    ' ========== COLONNE GAUCHE : ACTIONS ==========
+    ' 0) Collecter
+    Set shp = ws.Shapes.AddShape(msoShapeRoundedRectangle, leftPos, TopOf("0"), w, h)
+    With shp
+        .TextFrame2.TextRange.text = "Collecter les fichiers (.csv)" & vbCrLf & "Depuis le dossier \data"
+        .OnAction = "CollectFiles"
+        .Fill.ForeColor.RGB = RGB(0, 176, 80)
+        .line.ForeColor.RGB = RGB(0, 97, 0)
+        With .TextFrame2.TextRange.Paragraphs(1).Font: .name = "Calibri Light": .Size = 14: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+        With .TextFrame2.TextRange.Paragraphs(2).Font: .name = "Calibri Light": .Size = 10: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+    End With
+
+    ' 1) Convertir en mV — remonté juste sous la ligne 0 (plus de “trou”)
+    Set shp = ws.Shapes.AddShape(msoShapeRoundedRectangle, leftPos, TopOf("1"), w, h)
+    With shp
+        .TextFrame2.TextRange.text = "Convertir en mV (×1000)" & vbCrLf & "Évite double conversion (UNIT=mV)"
+        .OnAction = "ConvertirEnmV"
+        .Fill.ForeColor.RGB = RGB(255, 165, 0)
+        .line.ForeColor.RGB = RGB(205, 102, 0)
+        With .TextFrame2.TextRange.Paragraphs(1).Font: .name = "Calibri Light": .Size = 14: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+        With .TextFrame2.TextRange.Paragraphs(2).Font: .name = "Calibri Light": .Size = 10: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+    End With
+
+    ' 2) Dupliquer
+    Set shp = ws.Shapes.AddShape(msoShapeRoundedRectangle, leftPos, TopOf("2"), w, h)
+    With shp
+        .TextFrame2.TextRange.text = "Dupliquer" & vbCrLf & "Créer x<Nom> pour chaque individu"
+        .OnAction = "DupliquerSheets"
+        .Fill.ForeColor.RGB = RGB(255, 215, 0)
+        .line.ForeColor.RGB = RGB(180, 120, 0)
+        With .TextFrame2.TextRange.Paragraphs(1).Font: .name = "Calibri Light": .Size = 14: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+        With .TextFrame2.TextRange.Paragraphs(2).Font: .name = "Calibri Light": .Size = 10: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+    End With
+
+    ' 3) Moyenne des réplicats
+    Set shp = ws.Shapes.AddShape(msoShapeRoundedRectangle, leftPos, TopOf("3"), w, h)
+    With shp
+        .TextFrame2.TextRange.text = "Moyenne des réplicats" & vbCrLf & "Fusionne colonnes identiques (x…)"
+        .OnAction = "MoyenneDesReplicats"
+        .Fill.ForeColor.RGB = RGB(153, 51, 255)
+        .line.ForeColor.RGB = RGB(90, 0, 160)
+        With .TextFrame2.TextRange.Paragraphs(1).Font: .name = "Calibri Light": .Size = 14: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+        With .TextFrame2.TextRange.Paragraphs(2).Font: .name = "Calibri Light": .Size = 10: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+    End With
+
+    ' 4) Ordonner colonnes
+    Set shp = ws.Shapes.AddShape(msoShapeRoundedRectangle, leftPos, TopOf("4"), w, h)
+    With shp
+        .TextFrame2.TextRange.text = "Ordonner colonnes (x…)" & vbCrLf & "Liste 'Ordre_Liste' (feuille/fichier)"
+        .OnAction = "ReordonnerColonnesXSHEETS"
+        .Fill.ForeColor.RGB = RGB(255, 20, 147)
+        .line.ForeColor.RGB = RGB(219, 48, 105)
+        With .TextFrame2.TextRange.Paragraphs(1).Font: .name = "Calibri Light": .Size = 14: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+        With .TextFrame2.TextRange.Paragraphs(2).Font: .name = "Calibri Light": .Size = 10: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+    End With
+
+    ' 5) Courbes par individu (PLOT_)
+    Set shp = ws.Shapes.AddShape(msoShapeRoundedRectangle, leftPos, TopOf("5"), w, h)
+    With shp
+        .TextFrame2.TextRange.text = "Courbes par individu" & vbCrLf & "Crée des onglets PLOT_<x…>"
+        .OnAction = "PlotRawCurvesForXSheets"
+        .Fill.ForeColor.RGB = RGB(0, 112, 192)
+        .line.ForeColor.RGB = RGB(0, 70, 140)
+        With .TextFrame2.TextRange.Paragraphs(1).Font: .name = "Calibri Light": .Size = 14: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+        With .TextFrame2.TextRange.Paragraphs(2).Font: .name = "Calibri Light": .Size = 10: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+    End With
+
+    ' 6) Mini-graphs (PLOTS_X_GRID)
+    Set shp = ws.Shapes.AddShape(msoShapeRoundedRectangle, leftPos, TopOf("6"), w, h)
+    With shp
+        .TextFrame2.TextRange.text = "Mini-graphs bruts (x…)" & vbCrLf & "Tous les x… sur une seule page"
+        .OnAction = "PlotMiniAllX"
+        .Fill.ForeColor.RGB = RGB(0, 95, 95)
+        .line.ForeColor.RGB = RGB(0, 110, 110)
+        With .TextFrame2.TextRange.Paragraphs(1).Font: .name = "Calibri Light": .Size = 14: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+        With .TextFrame2.TextRange.Paragraphs(2).Font: .name = "Calibri Light": .Size = 10: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+    End With
+
+    ' ========== COLONNE DROITE : SUPPRESSIONS (alignées par rangée) ==========
+    ' 0) Supprimer global
+    Set shp = ws.Shapes.AddShape(msoShapeRoundedRectangle, leftPosR, TopOf("0"), w, h)
+    With shp
+        .TextFrame2.TextRange.text = "Supprimer (global)" & vbCrLf & "Tout sauf TABLEAU_DE_BORD"
+        .OnAction = "DeleteDataSheets"
+        .Fill.ForeColor.RGB = RGB(255, 77, 77)
+        .line.ForeColor.RGB = RGB(139, 0, 0)
+        With .TextFrame2.TextRange.Paragraphs(1).Font: .name = "Calibri Light": .Size = 14: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+        With .TextFrame2.TextRange.Paragraphs(2).Font: .name = "Calibri Light": .Size = 10: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+    End With
+
+    ' 2) Supprimer x<Nom> (aligné face à Dupliquer)
+    Set shp = ws.Shapes.AddShape(msoShapeRoundedRectangle, leftPosR, TopOf("2"), w, h)
+    With shp
+        .TextFrame2.TextRange.text = "Supprimer x<Nom>" & vbCrLf & "Efface toutes les feuilles x…"
+        .OnAction = "DeleteXSheets"
+        .Fill.ForeColor.RGB = RGB(255, 224, 128)
+        .line.ForeColor.RGB = RGB(180, 120, 0)
+        With .TextFrame2.TextRange.Paragraphs(1).Font: .name = "Calibri Light": .Size = 14: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+        With .TextFrame2.TextRange.Paragraphs(2).Font: .name = "Calibri Light": .Size = 10: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+    End With
+
+    ' 5) Supprimer PLOT_* (aligné face à Courbes par individu)
+    Set shp = ws.Shapes.AddShape(msoShapeRoundedRectangle, leftPosR, TopOf("5"), w, h)
+    With shp
+        .TextFrame2.TextRange.text = "Supprimer PLOT_*" & vbCrLf & "Efface les onglets PLOT_<x…>"
+        .OnAction = "DeletePlotSheets"
+        .Fill.ForeColor.RGB = RGB(173, 216, 230)
+        .line.ForeColor.RGB = RGB(0, 70, 140)
+        With .TextFrame2.TextRange.Paragraphs(1).Font: .name = "Calibri Light": .Size = 14: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+        With .TextFrame2.TextRange.Paragraphs(2).Font: .name = "Calibri Light": .Size = 10: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+    End With
+
+    ' 6) Supprimer PLOTS_X_GRID (aligné face à Mini-graphs)
+    Set shp = ws.Shapes.AddShape(msoShapeRoundedRectangle, leftPosR, TopOf("6"), w, h)
+    With shp
+        .TextFrame2.TextRange.text = "Supprimer PLOTS_X_GRID" & vbCrLf & "Efface la page de mini-graphs"
+        .OnAction = "DeletePlotGrid"
+        .Fill.ForeColor.RGB = RGB(0, 191, 179)
+        .line.ForeColor.RGB = RGB(0, 95, 95)
+        With .TextFrame2.TextRange.Paragraphs(1).Font: .name = "Calibri Light": .Size = 14: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+        With .TextFrame2.TextRange.Paragraphs(2).Font: .name = "Calibri Light": .Size = 10: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+    End With
+    ' 7) Supprimer feuilles importées (brutes) — aligné sous Supprimer global
+Set shp = ws.Shapes.AddShape(msoShapeRoundedRectangle, leftPosR, TopOf("1"), w, h)
+With shp
+    .TextFrame2.TextRange.text = "Supprimer feuilles importées" & vbCrLf & "Onglets bruts (hors x/PLOT/odeurs)"
+    .OnAction = "DeleteBaseDataSheets"
+    .Fill.ForeColor.RGB = RGB(144, 238, 144)   ' vert clair (assorti au Collecter)
+    .line.ForeColor.RGB = RGB(0, 97, 0)
+    With .TextFrame2.TextRange.Paragraphs(1).Font: .name = "Calibri Light": .Size = 14: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+    With .TextFrame2.TextRange.Paragraphs(2).Font: .name = "Calibri Light": .Size = 10: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+End With
+
+        ' --- colonnes C et D pour les nouveaux boutons "Tri par odeur" et "Supprimer onglets d’odeur"
+    Dim leftPosC As Double, leftPosD As Double
+    leftPosC = leftPosR + w + 60    ' 3e colonne (à droite de "Supprimer global")
+    leftPosD = leftPosC + w + 60    ' 4e colonne (le "en face" du Tri)
+
+    ' C1) TRI PAR ODEUR (couleur reprise de ta 1ère colonne : rose vif)
+    Set shp = ws.Shapes.AddShape(msoShapeRoundedRectangle, leftPosC, TopOf("0"), w, h)
+    With shp
+        .TextFrame2.TextRange.text = "Tri par odeur" & vbCrLf & "Crée 1 onglet/odeur (ordre = Ordre_Liste)"
+        .OnAction = "TriParOdeur"
+        .Fill.ForeColor.RGB = RGB(255, 20, 147)   ' rose vif (même thème que "Ordonner")
+        .line.ForeColor.RGB = RGB(219, 48, 105)   ' rose foncé (bordure)
+        With .TextFrame2.TextRange.Paragraphs(1).Font: .name = "Calibri Light": .Size = 14: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+        With .TextFrame2.TextRange.Paragraphs(2).Font: .name = "Calibri Light": .Size = 10: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+    End With
+
+    ' D1) SUPPRIMER ONGlets d’odeur (teinte + claire)
+    Set shp = ws.Shapes.AddShape(msoShapeRoundedRectangle, leftPosD, TopOf("0"), w, h)
+    With shp
+        .TextFrame2.TextRange.text = "Supprimer onglets d’odeur" & vbCrLf & "Efface tous les onglets (liste Ordre_Liste)"
+        .OnAction = "DeleteOdeurSheets"
+        .Fill.ForeColor.RGB = RGB(255, 182, 193)  ' rose clair
+        .line.ForeColor.RGB = RGB(219, 48, 105)   ' bordure assortie
+        With .TextFrame2.TextRange.Paragraphs(1).Font: .name = "Calibri Light": .Size = 14: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+        With .TextFrame2.TextRange.Paragraphs(2).Font: .name = "Calibri Light": .Size = 10: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+    End With
+    ' C1) ANALYSE — ouvre la feuille de paramètres et le bouton Calcul
+Set shp = ws.Shapes.AddShape(msoShapeRoundedRectangle, leftPosC, TopOf("1"), w, h)
+With shp
+    .TextFrame2.TextRange.text = "Analyse" & vbCrLf & "Paramètres + Calcul des réponses"
+    .OnAction = "OpenAnalyse"
+    .Fill.ForeColor.RGB = RGB(0, 176, 80)     ' vert (assorti à Collecter)
+    .line.ForeColor.RGB = RGB(0, 97, 0)
+    With .TextFrame2.TextRange.Paragraphs(1).Font: .name = "Calibri Light": .Size = 14: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+    With .TextFrame2.TextRange.Paragraphs(2).Font: .name = "Calibri Light": .Size = 10: .Fill.ForeColor.RGB = RGB(0, 0, 0): End With
+End With
+' === Supprimer Calcul_Réponse (aligné à droite de "Analyse") ===
+Dim rightColLeftPos As Double, topAnalyse As Double
+rightColLeftPos = leftPos + (w * 1.4) + 100   ' ajustement horizontal pour la colonne droite
+topAnalyse = TopOf("7")                       ' même hauteur que le bouton Analyse
+
+Set shp = ws.Shapes.AddShape(msoShapeRoundedRectangle, leftPosD, TopOf("1"), w, h)
+With shp
+    .TextFrame2.TextRange.text = "Supprimer Calcul_Réponse" & vbCrLf & "Efface la feuille de calcul des réponses"
+    .OnAction = "DeleteCalculResponse"
+    .Fill.ForeColor.RGB = RGB(144, 238, 144)   ' vert clair
+    .line.ForeColor.RGB = RGB(34, 139, 34)     ' vert foncé contour
+    With .TextFrame2.TextRange.Paragraphs(1).Font
+        .name = "Calibri Light": .Size = 14: .Fill.ForeColor.RGB = RGB(0, 0, 0)
+    End With
+    With .TextFrame2.TextRange.Paragraphs(2).Font
+        .name = "Calibri Light": .Size = 10: .Fill.ForeColor.RGB = RGB(0, 0, 0)
+    End With
+End With
+
+End Sub
+
+
+
+'========================
+' STIMLIST (associe noms de stim aux Rec)
+'========================
+Private Function LoadStimNamesOrdered(ByVal dataFileFullPath As String) As Variant
+    Dim base As String, folder As String, stimPath As String, try1 As String
+    folder = Left$(dataFileFullPath, InStrRev(dataFileFullPath, Application.PathSeparator))
+    base = GetBaseName(Mid$(dataFileFullPath, InStrRev(dataFileFullPath, Application.PathSeparator) + 1))
+    
+    Dim root As String: root = GetRootFolder()
+    If root = "" Then LoadStimNamesOrdered = Array(): Exit Function
+    
+    If Len(STIM_SUBFOLDER) > 0 And FolderExists(JoinPath(root, STIM_SUBFOLDER)) Then
+        try1 = JoinPath(JoinPath(root, STIM_SUBFOLDER), base & "_stimlist.csv")
+    End If
+    If try1 <> "" And Dir(try1) <> "" Then
+        stimPath = try1
+    ElseIf Dir(folder & base & "_stimlist.csv") <> "" Then
+        stimPath = folder & base & "_stimlist.csv"
+    Else
+        LogMsg "Pas de stimlist pour " & base & " ? colonnes nommées Rec-1, Rec-2, ..."
+        LoadStimNamesOrdered = Array()
+        Exit Function
+    End If
+    
+    Dim f As String: f = ReadFileAllTextSmart(stimPath)
+    If Len(f) = 0 Then
+        LogMsg "Stimlist illisible: " & stimPath
+        LoadStimNamesOrdered = Array(): Exit Function
+    End If
+    
+    Dim lines As Variant, k As Long, line As String, parts As Variant
+    Dim idxs() As Long, names() As String, n As Long, i As Long, j As Long, ti As Long, ts As String
+    lines = SplitToLines(f)
+    For k = LBound(lines) To UBound(lines)
+        line = NormalizeLine(CStr(lines(k)))
+        If Len(line) = 0 Then GoTo cont
+        parts = SplitFields(line)
+        If UBound(parts) >= 2 Then
+            If IsNumeric(Trim$(parts(0))) Then
+                n = n + 1
+                ReDim Preserve idxs(1 To n)
+                ReDim Preserve names(1 To n)
+                idxs(n) = CLng(Trim$(parts(0)))
+                names(n) = CStr(Trim$(parts(2)))
+            End If
+        End If
+cont:
+    Next k
+    
+    ' tri par index croissant
+    For i = 1 To n - 1
+        For j = i + 1 To n
+            If idxs(j) < idxs(i) Then
+                ti = idxs(i): idxs(i) = idxs(j): idxs(j) = ti
+                ts = names(i): names(i) = names(j): names(j) = ts
+            End If
+        Next j
+    Next i
+    
+    If n = 0 Then
+        LoadStimNamesOrdered = Array()
+    Else
+        Dim out() As String: ReDim out(1 To n)
+        For i = 1 To n: out(i) = names(i): Next i
+        LoadStimNamesOrdered = out
+    End If
+End Function
+
+'========================
+' IMPORT D'UN CSV
+'========================
+Private Sub ImportCsvAsTimePlusRecs(ByVal fullPath As String, ByVal targetSheetName As String)
+    Dim stimNames As Variant: stimNames = LoadStimNamesOrdered(fullPath)
+    Dim raw As String: raw = ReadFileAllTextSmart(fullPath)
+    If Len(raw) = 0 Then
+        LogMsg "Impossible de lire (encodage?): " & fullPath
+        Exit Sub
+    End If
+    
+    Dim lines As Variant, k As Long, line As String, parts As Variant
+    lines = SplitToLines(raw)
+    
+    Dim inData As Boolean, currentRec As Long
+    Dim times() As Double, maxRows As Long, rowCount As Long
+    Dim recValues As Object: Set recValues = CreateObject("Scripting.Dictionary")
+    
+    inData = False: currentRec = 0: maxRows = 0: rowCount = 0
+    
+    For k = LBound(lines) To UBound(lines)
+        line = NormalizeLine(CStr(lines(k)))
+        If Len(line) = 0 Then
+            ' skip
+        ElseIf IsRecHeader(line) Then
+            inData = False
+            currentRec = currentRec + 1
+            rowCount = 0
+            If Not recValues.Exists(currentRec) Then
+                Dim initArr() As Double: ReDim initArr(1 To 1)
+                recValues.Add currentRec, initArr
+            End If
+        ElseIf (InStr(1, LCase$(line), "value") > 0) And (InStr(1, LCase$(line), "time") > 0) Then
+            inData = True
+        ElseIf inData Then
+            parts = SplitFields(line)
+            If UBound(parts) >= 1 Then
+                Dim v As Double, t As Double, arrVals() As Double
+                v = ToNumber(parts(0))
+                t = ToNumber(parts(1))
+                
+                If currentRec = 1 Then
+                    maxRows = maxRows + 1
+                    ReDim Preserve times(1 To maxRows)
+                    times(maxRows) = t
+                ElseIf rowCount + 1 > maxRows Then
+                    maxRows = rowCount + 1
+                    ReDim Preserve times(1 To maxRows)
+                    times(maxRows) = t
+                End If
+                
+                rowCount = rowCount + 1
+                arrVals = recValues(currentRec)
+                If UBound(arrVals) < rowCount Then ReDim Preserve arrVals(1 To rowCount)
+                arrVals(rowCount) = v
+                recValues(currentRec) = arrVals
+            End If
+        End If
+    Next k
+    
+    ' === écriture feuille ===
+    Dim ws As Worksheet, r As Long, c As Long, recCount As Long
+    If SheetExists(targetSheetName) Then
+        Set ws = Worksheets(targetSheetName)
+        ws.Cells.Clear
+    Else
+        Set ws = Worksheets.Add(After:=Worksheets(Worksheets.Count))
+        ws.name = targetSheetName
+    End If
+    
+    recCount = recValues.Count
+    If maxRows = 0 Or recCount = 0 Then
+        ws.Range("A1").Value = "Aucune donnée lue"
+        Exit Sub
+    End If
+    
+    ws.Cells(1, 1).Value = "time"
+    For c = 1 To recCount
+        Dim hdr As String
+        If IsArray(stimNames) Then On Error Resume Next: hdr = stimNames(c): On Error GoTo 0
+        If Len(Trim$(hdr)) = 0 Then hdr = "Rec-" & c
+        ws.Cells(1, c + 1).Value = hdr
+    Next c
+    
+    For r = 1 To maxRows
+        ws.Cells(r + 1, 1).Value = times(r)
+    Next r
+    
+    Dim arr() As Double
+    For c = 1 To recCount
+        arr = recValues(c)
+        For r = 1 To UBound(arr)
+            ws.Cells(r + 1, c + 1).Value = arr(r)
+        Next r
+    Next c
+    
+    ws.Rows(1).Font.Bold = True
+    ws.Columns.AutoFit
+End Sub
+
+'========================
+' ENUMERATION DES FICHIERS
+'========================
+Private Function EnumerateDataCsvs() As Collection
+    Dim root As String: root = GetRootFolder()
+    Dim col As New Collection
+    If root = "" Then Set EnumerateDataCsvs = col: Exit Function
+    
+    Dim folder1 As String, folder2 As String
+    folder1 = root
+    folder2 = IIf(Len(DATA_SUBFOLDER) > 0, JoinPath(root, DATA_SUBFOLDER), "")
+    
+    Dim f As String
+    f = Dir(folder1 & "*.csv")
+    Do While Len(f) > 0
+        If LCase$(Right$(f, 13)) <> "_stimlist.csv" Then col.Add folder1 & f
+        f = Dir()
+    Loop
+    
+    If Len(folder2) > 0 And FolderExists(folder2) Then
+        f = Dir(folder2 & Application.PathSeparator & "*.csv")
+        Do While Len(f) > 0
+            If LCase$(Right$(f, 13)) <> "_stimlist.csv" Then col.Add folder2 & Application.PathSeparator & f
+            f = Dir()
+        Loop
+    End If
+    
+    Set EnumerateDataCsvs = col
+End Function
+
+'========================
+' BOUTONS DU DASHBOARD
+'========================
+Public Sub CollectFiles()
+    Dim files As Collection: Set files = EnumerateDataCsvs()
+    If files Is Nothing Or files.Count = 0 Then
+        MsgBox "Aucun CSV trouvé. Place tes fichiers dans '" & DATA_SUBFOLDER & "\'." & vbCrLf & _
+               "Et les stimlists dans '" & STIM_SUBFOLDER & "\'.", vbExclamation
+        Exit Sub
+    End If
+    
+    Application.ScreenUpdating = False
+    Dim i As Long, fullPath As String, base As String, shName As String
+    For i = 1 To files.Count
+        fullPath = files(i)
+        base = GetBaseName(Mid$(fullPath, InStrRev(fullPath, Application.PathSeparator) + 1))
+        shName = CleanSheetName(base)
+        ImportCsvAsTimePlusRecs fullPath, shName
+    Next i
+    Application.ScreenUpdating = True
+    
+    MsgBox "Import terminé : 1 individu par onglet", vbInformation
+End Sub
+
+Public Sub DeleteDataSheets()
+    Dim ws As Worksheet, countDel As Long
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False
+    On Error Resume Next
+    For Each ws In ThisWorkbook.Worksheets
+        If ws.name <> "TABLEAU_DE_BORD" Then
+            ws.Delete
+            If Err.Number = 0 Then countDel = countDel + 1 Else Err.Clear
+        End If
+    Next ws
+    Application.DisplayAlerts = True
+    Application.ScreenUpdating = True
+    MsgBox countDel & " feuille(s) supprimée(s).", vbInformation
+
+End Sub
+
+'========================
+' CONVERSION DES DONNÉES EN mV (×1000)
+'========================
+Public Sub ConvertirEnmV()
+    Const FACTEUR As Double = 1000#
+    Dim ws As Worksheet
+    Dim lastRow As Long, lastCol As Long
+    Dim r As Long, c As Long
+    Dim v As Variant
+    Dim convertedSheets As Long
+    Dim unitLabel As String
+    Dim cp As Object  ' CustomProperty
+
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+
+    For Each ws In ThisWorkbook.Worksheets
+        If ws.name <> "TABLEAU_DE_BORD" And ws.name <> "LOG" And ws.name <> "PALETTE" Then
+
+            ' détecte si déjà en mV (via CustomProperties)
+            unitLabel = ""
+            On Error Resume Next
+            unitLabel = CStr(ws.CustomProperties("UNIT").Value)
+            On Error GoTo 0
+            If UCase$(unitLabel) = "MV" Then GoTo nextSheet
+
+            ' borne du bloc de données (time en A, données B..)
+            lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+            lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+
+            If lastRow >= 2 And lastCol >= 2 Then
+                For c = 2 To lastCol
+                    For r = 2 To lastRow
+                        v = ws.Cells(r, c).Value
+                        If IsNumeric(v) And Not IsEmpty(v) Then
+                            ws.Cells(r, c).Value = CDbl(v) * FACTEUR
+                        End If
+                    Next r
+                Next c
+
+                ' marque l’unité proprement dans les propriétés personnalisées
+                On Error Resume Next
+                Set cp = ws.CustomProperties("UNIT")
+                If cp Is Nothing Then
+                    ws.CustomProperties.Add "UNIT", "mV"
+                Else
+                    cp.Value = "mV"
+                End If
+                On Error GoTo 0
+
+                convertedSheets = convertedSheets + 1
+            End If
+        End If
+nextSheet:
+    Next ws
+
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+
+    MsgBox "Conversion terminée : " & convertedSheets & " feuille(s) en mV (×1000).", vbInformation
+End Sub
+'========================
+' DUPLIQUER
+'========================
+Public Sub DupliquerSheets()
+    Dim ws As Worksheet, tgt As Worksheet, xName As String
+    Dim n As Long
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False
+    
+    For Each ws In ThisWorkbook.Worksheets
+        If IsDataSheet(ws) And Left$(ws.name, 1) <> "x" Then
+            xName = XNameOf(ws.name)
+            ' si la cible existe déjà, on la remplace
+            On Error Resume Next
+            Worksheets(xName).Delete
+            On Error GoTo 0
+            ws.Copy After:=ws ' duplique juste après
+            Set tgt = ActiveSheet
+            tgt.name = xName
+            n = n + 1
+        End If
+    Next ws
+    
+    Application.DisplayAlerts = True
+    Application.ScreenUpdating = True
+    MsgBox n & " feuille(s) dupliquée(s) (préfixe 'x').", vbInformation
+End Sub
+'========================
+' MOYENNE DES REPLICATS
+'========================
+Public Sub MoyenneDesReplicats()
+    ' Nouvelle version FULL REBUILD :
+    ' Pour chaque feuille x... :
+    '   - On lit toutes les colonnes existantes
+    '   - On groupe par odeur (entête en ligne 1)
+    '   - On calcule la moyenne des réplicats ligne par ligne
+    '   - On réécrit la feuille à partir de zéro :
+    '       time | Odeur1 | Odeur2 | ...
+    '
+    '   -> plus de suppression en direct de colonnes : beaucoup plus fiable
+
+    Dim ws As Worksheet
+    Dim lastCol As Long, lastRow As Long
+    Dim c As Long, r As Long
+
+    Dim odorCols As Object          ' dict : odorName -> Collection of column indices
+    Dim odorName As String
+    Dim tmpColList As Collection
+
+    Dim odorKeys As Variant
+    Dim i As Long, idx As Long
+    Dim thisCol As Long
+    Dim v As Variant
+
+    Dim timeArr As Variant          ' colonne A (time)
+    Dim resultArr() As Variant      ' matrice finale à réécrire
+    Dim outColCount As Long
+    Dim outRowCount As Long
+
+    Dim avgVal As Double, nVal As Long
+
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+
+    For Each ws In ThisWorkbook.Worksheets
+
+        If Left$(ws.name, 1) = "x" Then
+
+            ' sécurité basique : doit ressembler à nos sheets x
+            If LCase$(CStr(ws.Cells(1, 1).Value)) <> "time" Then
+                GoTo nextWs
+            End If
+
+            ' dimensions source
+            lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+            lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+            If lastCol < 2 Or lastRow < 2 Then GoTo nextWs
+
+            ' récupère la colonne temps (A)
+            timeArr = ws.Range(ws.Cells(1, 1), ws.Cells(lastRow, 1)).Value
+            outRowCount = lastRow
+
+            ' 1. Construire dictionnaire odeur -> liste de colonnes
+            Set odorCols = CreateObject("Scripting.Dictionary")
+
+            For c = 2 To lastCol
+                Dim header As String
+                header = Trim$(CStr(ws.Cells(1, c).Value))
+
+                ' ignorer les colonnes vides ou UNIT:...
+                If header <> "" Then
+                    If Left$(UCase$(header), 5) <> "UNIT:" Then
+                        If Not odorCols.Exists(header) Then
+                            Set tmpColList = New Collection
+                            tmpColList.Add c
+                            odorCols.Add header, tmpColList
+                        Else
+                            odorCols(header).Add c
+                        End If
+                    End If
+                End If
+            Next c
+
+            If odorCols.Count = 0 Then
+                ' rien à faire -> passe
+                GoTo nextWs
+            End If
+
+            ' 2. On prépare la matrice résultat
+            '    nbr colonnes sortie = 1 (time) + nb d'odeurs uniques
+            odorKeys = odorCols.Keys
+            outColCount = 1 + odorCols.Count
+            ReDim resultArr(1 To outRowCount, 1 To outColCount)
+
+            ' colonne 1 = time
+            For r = 1 To outRowCount
+                resultArr(r, 1) = timeArr(r, 1)
+            Next r
+            resultArr(1, 1) = "time" ' header correct en ligne 1
+
+            ' 3. Pour chaque odeur unique, calculer moyenne ligne par ligne
+            '    et remplir resultArr(:, colOut)
+            Dim outCol As Long
+            outCol = 2
+
+            For i = LBound(odorKeys) To UBound(odorKeys)
+
+                odorName = CStr(odorKeys(i))
+                Set tmpColList = odorCols(odorName) ' toutes les colonnes source correspondant à cette odeur
+
+                ' Entête
+                resultArr(1, outCol) = odorName
+
+                ' pour chaque ligne de données (2..lastRow)
+                For r = 2 To outRowCount
+                    avgVal = 0#
+                    nVal = 0
+
+                    ' boucle sur chaque colonne réplicat de cette odeur
+                    For idx = 1 To tmpColList.Count
+                        thisCol = tmpColList(idx)
+                        v = ws.Cells(r, thisCol).Value
+                        If IsNumeric(v) And Not IsEmpty(v) Then
+                            avgVal = avgVal + CDbl(v)
+                            nVal = nVal + 1
+                        End If
+                    Next idx
+
+                    If nVal > 0 Then
+                        resultArr(r, outCol) = avgVal / nVal
+                    Else
+                        resultArr(r, outCol) = Empty
+                    End If
+                Next r
+
+                outCol = outCol + 1
+            Next i
+
+            ' 4. On efface la feuille et on réécrit ce tableau propre
+            ws.Cells.Clear
+            ws.Range(ws.Cells(1, 1), ws.Cells(outRowCount, outColCount)).Value = resultArr
+
+            ' mise en forme
+            ws.Rows(1).Font.Bold = True
+            ws.Columns.AutoFit
+
+        End If
+
+nextWs:
+    Next ws
+
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+
+    MsgBox "Moyenne des réplicats : terminé. Chaque odeur apparaît exactement une fois, aucune colonne perdue ou dupliquée.", vbInformation
+End Sub
+
+
+
+'========================
+' Charger l'ordre désiré (Ordre_Liste)
+'========================
+Private Function LoadDesiredOrderList() As Collection
+    Dim col As New Collection
+    Dim ws As Worksheet, wb As Workbook, p As String
+    Dim lastRow As Long, r As Long, val As String
+    
+    ' 1) Feuille "Ordre_Liste" dans ce classeur ?
+    If SheetExists("Ordre_Liste") Then
+        Set ws = ThisWorkbook.Worksheets("Ordre_Liste")
+        lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+        For r = 1 To lastRow
+            val = Trim$(CStr(ws.Cells(r, 1).Value))
+            If Len(val) > 0 Then col.Add val
+        Next r
+        Set LoadDesiredOrderList = col
+        Exit Function
+    End If
+    
+    ' 2) Fichier "Ordre_Liste.xlsx" à côté du classeur ?
+    p = GetRootFolder() & "Ordre_Liste.xlsx"
+    If Len(p) > 0 And Dir(p) <> "" Then
+        On Error Resume Next
+        Set wb = Workbooks.Open(fileName:=p, ReadOnly:=True)
+        On Error GoTo 0
+        If Not wb Is Nothing Then
+            ' On prend la 1ère feuille, col A
+            Set ws = wb.Worksheets(1)
+            lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+            For r = 1 To lastRow
+                val = Trim$(CStr(ws.Cells(r, 1).Value))
+                If Len(val) > 0 Then col.Add val
+            Next r
+            wb.Close SaveChanges:=False
+            Set LoadDesiredOrderList = col
+            Exit Function
+        End If
+    End If
+    
+    ' 3) Rien trouvé
+    Set LoadDesiredOrderList = col ' vide
+End Function
+
+'========================
+' Réordonner colonnes d'une feuille x… selon la liste
+'========================
+Private Sub ReorderColumnsInSheet(ByVal ws As Worksheet, ByVal orderList As Collection)
+    Dim lastRow As Long, lastCol As Long, c As Long, r As Long
+    Dim hdr As String
+    Dim headers As Object, usedCols As Object
+    Dim keepOrder As New Collection
+    Dim k As Variant
+    
+    If LCase$(CStr(ws.Cells(1, 1).Value)) <> "time" Then Exit Sub
+    
+    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    If lastRow < 2 Or lastCol < 2 Then Exit Sub
+    
+    Set headers = CreateObject("Scripting.Dictionary") ' header (UCase) -> col index (1..)
+    Set usedCols = CreateObject("Scripting.Dictionary") ' col index -> True
+    
+    ' Map des entêtes actuelles
+    For c = 2 To lastCol
+        hdr = Trim$(CStr(ws.Cells(1, c).Value))
+        If Len(hdr) > 0 And Left$(UCase$(hdr), 5) <> "UNIT:" Then
+            If Not headers.Exists(UCase$(hdr)) Then headers.Add UCase$(hdr), c
+        End If
+    Next c
+    
+    ' 1) colonnes dans l'ordre demandé
+    If Not orderList Is Nothing And orderList.Count > 0 Then
+        For Each k In orderList
+            hdr = Trim$(CStr(k))
+            If headers.Exists(UCase$(hdr)) Then
+                keepOrder.Add CLng(headers(UCase$(hdr)))
+                usedCols(CStr(headers(UCase$(hdr)))) = True
+            End If
+        Next k
+    End If
+    
+    ' 2) ajoute à la fin les colonnes restantes non listées (dans l'ordre actuel)
+    For c = 2 To lastCol
+        If Len(Trim$(CStr(ws.Cells(1, c).Value))) > 0 Then
+            If Left$(UCase$(CStr(ws.Cells(1, c).Value)), 5) <> "UNIT:" Then
+                If Not usedCols.Exists(CStr(c)) Then keepOrder.Add c
+            End If
+        End If
+    Next c
+    
+    ' Si aucune colonne à réordonner, on sort
+    If keepOrder.Count = 0 Then Exit Sub
+    
+    ' --- Reconstruction en mémoire et réécriture ---
+    Dim outCols As Long: outCols = keepOrder.Count + 1 ' + time
+    Dim arrIn As Variant, arrOut() As Variant
+    
+    arrIn = ws.Range(ws.Cells(1, 1), ws.Cells(lastRow, lastCol)).Value
+    ReDim arrOut(1 To lastRow, 1 To outCols)
+    
+    ' Colonne 1 = time (copie directe)
+    For r = 1 To lastRow
+        arrOut(r, 1) = arrIn(r, 1)
+    Next r
+    
+    ' Colonnes réordonnées
+    For c = 1 To keepOrder.Count
+        Dim srcCol As Long: srcCol = CLng(keepOrder(c))
+        For r = 1 To lastRow
+            arrOut(r, c + 1) = arrIn(r, srcCol)
+        Next r
+    Next c
+    
+    ' Efface ancien bloc B..lastCol et réécrit le nouveau bloc
+    ws.Range(ws.Cells(1, 2), ws.Cells(lastRow, lastCol)).ClearContents
+    ws.Range(ws.Cells(1, 1), ws.Cells(lastRow, outCols)).Value = arrOut
+    
+    ws.Rows(1).Font.Bold = True
+    ws.Columns.AutoFit
+End Sub
+
+'========================
+' Bouton : réordonner toutes les feuilles x…
+'========================
+Public Sub ReordonnerColonnesXSHEETS()
+    Dim orderList As Collection
+    Dim ws As Worksheet
+    Dim n As Long
+    
+    Set orderList = LoadDesiredOrderList()
+    If orderList Is Nothing Or orderList.Count = 0 Then
+        MsgBox "Impossible de trouver la liste d'ordre." & vbCrLf & _
+               "Crée une feuille 'Ordre_Liste' (colonne A) dans ce classeur," & vbCrLf & _
+               "ou un fichier 'Ordre_Liste.xlsx' dans le même dossier.", vbExclamation
+        Exit Sub
+    End If
+    
+    Application.ScreenUpdating = False
+    For Each ws In ThisWorkbook.Worksheets
+        If Left$(ws.name, 1) = "x" Then
+            ReorderColumnsInSheet ws, orderList
+            n = n + 1
+        End If
+    Next ws
+    Application.ScreenUpdating = True
+    
+    MsgBox "Colonnes réordonnées sur " & n & " feuille(s) 'x…'.", vbInformation
+End Sub
+'========================
+' PALETTE — couleurs fortes et mapping Odeur -> Couleur (persisté dans la feuille cachée "PALETTE")
+'========================
+Private Function StrongColors() As Variant
+    Dim arr As Variant
+    arr = Array( _
+        RGB(0, 112, 192), _
+        RGB(255, 0, 0), _
+        RGB(0, 176, 80), _
+        RGB(255, 127, 0), _
+        RGB(128, 0, 128), _
+        RGB(0, 176, 240), _
+        RGB(192, 80, 77), _
+        RGB(112, 48, 160), _
+        RGB(255, 192, 0), _
+        RGB(0, 176, 146), _
+        RGB(255, 0, 255), _
+        RGB(0, 0, 0) _
+    )
+    StrongColors = arr
+End Function
+
+Private Sub EnsurePaletteInitialized()
+    Dim wsP As Worksheet
+    If Not SheetExists("PALETTE") Then
+        Set wsP = Worksheets.Add(After:=Worksheets(Worksheets.Count))
+        wsP.name = "PALETTE"
+        wsP.Range("A1:B1").Value = Array("Odor", "RGB")
+        wsP.Columns("A:B").ColumnWidth = 28
+        wsP.visible = xlSheetHidden
+    End If
+End Sub
+
+Private Function GetColorForOdor(ByVal odor As String, Optional ByVal addIfMissing As Boolean = True) As Long
+    Dim wsP As Worksheet, lastRow As Long, i As Long, colArr As Variant, nextIdx As Long
+    Dim o As String
+    o = Trim$(odor)
+    If Len(o) = 0 Then GetColorForOdor = RGB(0, 0, 0): Exit Function
+    
+    EnsurePaletteInitialized
+    Set wsP = Worksheets("PALETTE")
+    lastRow = wsP.Cells(wsP.Rows.Count, 1).End(xlUp).Row
+    
+    ' déjà présent ?
+    For i = 2 To lastRow
+        If StrComp(Trim$(wsP.Cells(i, 1).Value), o, vbTextCompare) = 0 Then
+            GetColorForOdor = CLng(wsP.Cells(i, 2).Value)
+            Exit Function
+        End If
+    Next i
+    
+    ' sinon on ajoute si demandé
+    If addIfMissing Then
+        colArr = StrongColors()
+        nextIdx = (lastRow - 1)        ' nombre déjà affecté
+        GetColorForOdor = colArr(nextIdx Mod (UBound(colArr) - LBound(colArr) + 1))
+        wsP.Cells(lastRow + 1, 1).Value = o
+        wsP.Cells(lastRow + 1, 2).Value = GetColorForOdor
+    Else
+        GetColorForOdor = RGB(0, 0, 0)
+    End If
+End Function
+
+' bootstrap : si PALETTE est vide, on prend la 1ère feuille x… (sinon la 1ère feuille de données) et on y lit les entêtes
+Public Sub BootstrapPaletteFromFirstSheet()
+    Dim wsP As Worksheet, wsD As Worksheet
+    Dim lastRow As Long, lastCol As Long, c As Long, hdr As String
+    
+    EnsurePaletteInitialized
+    Set wsP = Worksheets("PALETTE")
+    If wsP.Cells(wsP.Rows.Count, 1).End(xlUp).Row > 1 Then Exit Sub ' déjà remplie
+    
+    ' priorité : une feuille x…
+    For Each wsD In ThisWorkbook.Worksheets
+        If Left$(wsD.name, 1) = "x" And LCase$(CStr(wsD.Cells(1, 1).Value)) = "time" Then
+            lastCol = wsD.Cells(1, wsD.Columns.Count).End(xlToLeft).Column
+            For c = 2 To lastCol
+                hdr = CStr(wsD.Cells(1, c).Value)
+                If Len(Trim$(hdr)) > 0 And Left$(UCase$(hdr), 5) <> "UNIT:" Then
+                    Call GetColorForOdor(hdr, True)
+                End If
+            Next c
+            Exit Sub
+        End If
+    Next wsD
+    
+    ' sinon : 1ère feuille de données "classique"
+    For Each wsD In ThisWorkbook.Worksheets
+        If wsD.name <> "TABLEAU_DE_BORD" And wsD.name <> "LOG" And wsD.name <> "PALETTE" And Left$(wsD.name, 5) <> "PLOT_" Then
+            If LCase$(CStr(wsD.Cells(1, 1).Value)) = "time" Then
+                lastCol = wsD.Cells(1, wsD.Columns.Count).End(xlToLeft).Column
+                For c = 2 To lastCol
+                    hdr = CStr(wsD.Cells(1, c).Value)
+                    If Len(Trim$(hdr)) > 0 And Left$(UCase$(hdr), 5) <> "UNIT:" Then
+                        Call GetColorForOdor(hdr, True)
+                    End If
+                Next c
+                Exit Sub
+            End If
+        End If
+    Next wsD
+End Sub
+
+'========================
+' TRAÇAGE pour toutes les feuilles x…
+'========================
+Public Sub PlotRawCurvesForXSheets()
+    Dim ws As Worksheet, countDone As Long
+    Application.ScreenUpdating = False
+    
+    ' prépare la PALETTE
+    BootstrapPaletteFromFirstSheet
+    
+    For Each ws In ThisWorkbook.Worksheets
+        If Left$(ws.name, 1) = "x" Then
+            If LCase$(CStr(ws.Cells(1, 1).Value)) = "time" Then
+                PlotOneXIndividual ws
+                countDone = countDone + 1
+            End If
+        End If
+    Next ws
+    
+    Application.ScreenUpdating = True
+    MsgBox "Traçage terminé : " & countDone & " graphique(s) créé(s) pour les feuilles x…", vbInformation
+End Sub
+
+'========================
+' TRAÇAGE d'un individu x… (1 graphique multi-séries)
+'========================
+Private Sub PlotOneXIndividual(ByVal dataSheet As Worksheet)
+    Dim plotName As String, wsPlot As Worksheet
+    Dim lastRow As Long, lastCol As Long, c As Long
+    Dim ch As ChartObject, s As Series
+    Dim unitLabel As String
+    
+    If LCase$(CStr(dataSheet.Cells(1, 1).Value)) <> "time" Then Exit Sub
+    
+    ' feuille de plot
+    plotName = "PLOT_" & Left$(dataSheet.name, 23)
+    If SheetExists(plotName) Then
+        Set wsPlot = Worksheets(plotName)
+        wsPlot.Cells.Clear
+        On Error Resume Next
+        Dim co As ChartObject
+        For Each co In wsPlot.ChartObjects: co.Delete: Next co
+        On Error GoTo 0
+    Else
+        Set wsPlot = Worksheets.Add(After:=dataSheet)
+        wsPlot.name = plotName
+    End If
+    
+    ' style léger
+    wsPlot.Cells.Interior.Color = RGB(255, 255, 255)
+    wsPlot.Range("A1").Value = "Courbes brutes – " & dataSheet.name
+    With wsPlot.Range("A1")
+        .Font.name = "Calibri Light"
+        .Font.Size = 16
+        .Font.Bold = True
+    End With
+    
+    ' bornes
+    lastRow = dataSheet.Cells(dataSheet.Rows.Count, 1).End(xlUp).Row
+    lastCol = dataSheet.Cells(1, dataSheet.Columns.Count).End(xlToLeft).Column
+    If lastRow < 2 Or lastCol < 2 Then
+        wsPlot.Range("A3").Value = "Pas de données"
+        Exit Sub
+    End If
+    
+    ' unité dynamique
+    unitLabel = ""
+    On Error Resume Next
+    unitLabel = CStr(dataSheet.CustomProperties("UNIT").Value)
+    On Error GoTo 0
+    If unitLabel = "" Then unitLabel = "V"
+    
+    ' graphique XY lignes
+    Set ch = wsPlot.ChartObjects.Add(Left:=30, Top:=60, Width:=900, Height:=420)
+    With ch.Chart
+        .ChartType = xlXYScatterLines
+        .HasTitle = True
+        .ChartTitle.text = "Voltage en fonction du temps"
+        .Axes(xlCategory).HasTitle = True
+        .Axes(xlCategory).AxisTitle.text = "time"
+        .Axes(xlValue).HasTitle = True
+        .Axes(xlValue).AxisTitle.text = "Amplitude (" & unitLabel & ")"
+        .Legend.Position = xlLegendPositionRight
+    End With
+    
+    ' X = time
+    Dim xRng As Range, yRng As Range, hdr As String, colRGB As Long
+    Set xRng = dataSheet.Range(dataSheet.Cells(2, 1), dataSheet.Cells(lastRow, 1))
+    
+    ' séries : colonnes B..lastCol
+    For c = 2 To lastCol
+        hdr = CStr(dataSheet.Cells(1, c).Value)
+        If Len(Trim$(hdr)) > 0 And Left$(UCase$(hdr), 5) <> "UNIT:" Then
+            Set yRng = dataSheet.Range(dataSheet.Cells(2, c), dataSheet.Cells(lastRow, c))
+            Set s = ch.Chart.SeriesCollection.NewSeries
+            With s
+                .name = hdr
+                .XValues = xRng
+                .Values = yRng
+                colRGB = GetColorForOdor(hdr, True)
+                On Error Resume Next
+                .Format.line.ForeColor.RGB = colRGB
+                .Format.line.Weight = 1.5
+                On Error GoTo 0
+            End With
+        End If
+    Next c
+End Sub
+
+
+'========================
+' Onglet Minigraphiques pour chaque individu
+'========================
+Public Sub PlotMiniAllX()
+    Dim ws As Worksheet, wsPlot As Worksheet
+    Dim chartsPerRow As Long, cellW As Double, cellH As Double
+    Dim padX As Double, padY As Double, colIdx As Long, rowIdx As Long
+    Dim ch As ChartObject, countDone As Long, plotName As String
+    Dim legendLeft As Double, legendTop As Double
+    
+    ' prépare la PALETTE (si vide)
+    BootstrapPaletteFromFirstSheet
+    
+    plotName = "PLOTS_X_GRID"
+    Application.ScreenUpdating = False
+    
+    ' (re)crée la feuille de plots
+    If SheetExists(plotName) Then
+        Set wsPlot = Worksheets(plotName)
+        wsPlot.Cells.Clear
+        On Error Resume Next
+        Dim co As ChartObject
+        For Each co In wsPlot.ChartObjects: co.Delete: Next co
+        Dim sp As Shape
+        For Each sp In wsPlot.Shapes
+            If Left$(sp.name, 4) = "LEG_" Then sp.Delete
+        Next sp
+        On Error GoTo 0
+    Else
+        Set wsPlot = Worksheets.Add(After:=Worksheets(Worksheets.Count))
+        wsPlot.name = plotName
+    End If
+    
+    ' Mise en page
+    wsPlot.Cells.Interior.Color = RGB(255, 255, 255)
+    wsPlot.Range("A1").Value = "Mini-graphiques – feuilles x…"
+    With wsPlot.Range("A1")
+        .Font.name = "Calibri Light": .Font.Size = 16: .Font.Bold = True
+    End With
+    
+    ' Grille
+    chartsPerRow = 3        ' ? change à 2 / 4 si tu veux
+    cellW = 360             ' largeur d’un mini-graph
+    cellH = 200             ' hauteur d’un mini-graph
+    padX = 20: padY = 20
+    colIdx = 0: rowIdx = 0
+    
+    ' Trace tous les x…
+    For Each ws In ThisWorkbook.Worksheets
+        If Left$(ws.name, 1) = "x" And LCase$(CStr(ws.Cells(1, 1).Value)) = "time" Then
+            Dim L As Double, t As Double
+            L = padX + colIdx * (cellW + padX)
+            t = 50 + padY + rowIdx * (cellH + padY)
+            Set ch = wsPlot.ChartObjects.Add(Left:=L, Top:=t, Width:=cellW, Height:=cellH)
+            BuildMiniChart ch, ws
+            countDone = countDone + 1
+            colIdx = colIdx + 1
+            If colIdx >= chartsPerRow Then colIdx = 0: rowIdx = rowIdx + 1
+        End If
+    Next ws
+    
+    ' LÉGENDE GLOBALE à droite de la grille
+    legendLeft = padX + chartsPerRow * (cellW + padX) + 30
+    legendTop = 60
+    BuildGlobalLegend wsPlot, legendLeft, legendTop
+    
+    Application.ScreenUpdating = True
+    MsgBox "Mini-graphiques créés : " & countDone & " (feuilles x…).", vbInformation
+End Sub
+
+
+'========================
+' Créé les minigraphs pour chaque onglet x.
+'========================
+Private Sub BuildMiniChart(ByVal ch As ChartObject, ByVal dataSheet As Worksheet)
+    Dim lastRow As Long, lastCol As Long, c As Long
+    Dim xRng As Range, yRng As Range, s As Series, hdr As String
+    Dim colRGB As Long, unitLabel As String
+    
+    lastRow = dataSheet.Cells(dataSheet.Rows.Count, 1).End(xlUp).Row
+    lastCol = dataSheet.Cells(1, dataSheet.Columns.Count).End(xlToLeft).Column
+    If lastRow < 2 Or lastCol < 2 Then Exit Sub
+    
+    On Error Resume Next
+    unitLabel = CStr(dataSheet.CustomProperties("UNIT").Value)
+    On Error GoTo 0
+    If unitLabel = "" Then unitLabel = "V"
+    
+    With ch.Chart
+        .ChartType = xlXYScatterLines
+        .HasTitle = True
+        .ChartTitle.text = dataSheet.name & " – Voltage vs time"
+        .HasLegend = False                     ' légende externe
+        .PlotArea.Format.Fill.visible = msoFalse
+        .ChartArea.Format.line.visible = msoFalse
+        On Error Resume Next
+        .Axes(xlCategory).TickLabels.Font.Size = 8
+        .Axes(xlValue).TickLabels.Font.Size = 8
+        .Axes(xlCategory).HasTitle = False
+        .Axes(xlValue).HasTitle = False
+        On Error GoTo 0
+    End With
+    
+    Set xRng = dataSheet.Range(dataSheet.Cells(2, 1), dataSheet.Cells(lastRow, 1))
+    For c = 2 To lastCol
+        hdr = CStr(dataSheet.Cells(1, c).Value)
+        If Len(Trim$(hdr)) > 0 And Left$(UCase$(hdr), 5) <> "UNIT:" Then
+            Set yRng = dataSheet.Range(dataSheet.Cells(2, c), dataSheet.Cells(lastRow, c))
+            Set s = ch.Chart.SeriesCollection.NewSeries
+            With s
+                .name = hdr
+                .XValues = xRng
+                .Values = yRng
+                .MarkerStyle = xlMarkerStyleNone
+                colRGB = GetColorForOdor(hdr, True)
+                On Error Resume Next
+                .Format.line.ForeColor.RGB = colRGB
+                .Format.line.Weight = 1
+                On Error GoTo 0
+            End With
+        End If
+    Next c
+End Sub
+
+'========================
+' Crée la légende globale
+'========================
+Private Sub BuildGlobalLegend(ByVal ws As Worksheet, ByVal leftPos As Double, ByVal topPos As Double)
+    ' Légende à partir de la feuille PALETTE : gros texte, bloc à droite
+    Dim wsP As Worksheet, lastRow As Long, r As Long
+    Dim y As Double, sw As Shape, tx As Shape
+    Dim c As Long, name As String, colRGB As Long
+    Dim perCol As Long, colOffset As Double, blockW As Double
+    
+    If Not SheetExists("PALETTE") Then Exit Sub
+    Set wsP = Worksheets("PALETTE")
+    lastRow = wsP.Cells(wsP.Rows.Count, 1).End(xlUp).Row
+    If lastRow < 2 Then Exit Sub
+    
+    ' paramètres de layout
+    perCol = 16               ' nb d’items par colonne de légende
+    blockW = 260              ' largeur allouée à la légende
+    colOffset = 240           ' distance pour passer à la colonne suivante
+    y = topPos
+    
+    ' Titre du bloc
+    Dim title As Shape
+    On Error Resume Next
+    Dim sp As Shape
+    For Each sp In ws.Shapes
+        If Left$(sp.name, 4) = "LEG_" Then sp.Delete
+    Next sp
+    On Error GoTo 0
+    
+    Set title = ws.Shapes.AddTextbox(msoTextOrientationHorizontal, leftPos, y, blockW, 24)
+    title.name = "LEG_TITLE"
+    With title.TextFrame2
+        .TextRange.Characters.text = "Légende (odeurs)"
+        .TextRange.Font.name = "Calibri Light"
+        .TextRange.Font.Size = 14
+        .TextRange.Font.Bold = msoTrue
+        .MarginLeft = 2: .MarginRight = 2: .MarginTop = 2: .MarginBottom = 2
+    End With
+    y = y + 30
+    
+    ' Items
+    Dim i As Long, colIdx As Long, rowIdx As Long
+    colIdx = 0: rowIdx = 0
+    
+    For r = 2 To lastRow
+        name = Trim$(CStr(wsP.Cells(r, 1).Value))
+        If Len(name) > 0 Then
+            colRGB = CLng(wsP.Cells(r, 2).Value)
+            
+            ' nouvelle colonne si on dépasse perCol
+            If rowIdx >= perCol Then
+                rowIdx = 0
+                colIdx = colIdx + 1
+                y = topPos + 30
+            End If
+            
+            Dim xBase As Double, yBase As Double
+            xBase = leftPos + colIdx * colOffset
+            yBase = y + rowIdx * 22
+            
+            ' pastille couleur
+            Set sw = ws.Shapes.AddShape(msoShapeRectangle, xBase, yBase, 16, 12)
+            sw.name = "LEG_SW_" & r
+            With sw
+                .Fill.ForeColor.RGB = colRGB
+                .line.visible = msoTrue
+                .line.ForeColor.RGB = RGB(0, 0, 0)
+            End With
+            
+            ' texte
+            Set tx = ws.Shapes.AddTextbox(msoTextOrientationHorizontal, xBase + 22, yBase - 2, 200, 18)
+            tx.name = "LEG_TX_" & r
+            With tx.TextFrame2
+                .TextRange.Characters.text = name
+                .TextRange.Font.name = "Calibri Light"
+                .TextRange.Font.Size = 12
+                .MarginLeft = 0: .MarginRight = 0: .MarginTop = 0: .MarginBottom = 0
+            End With
+            
+            rowIdx = rowIdx + 1
+        End If
+    Next r
+End Sub
+
+'========================
+' 3 macros de suppression
+'========================
+Public Sub DeleteXSheets()
+    Dim ws As Worksheet, n As Long
+    Application.DisplayAlerts = False
+    For Each ws In ThisWorkbook.Worksheets
+        If Left$(ws.name, 1) = "x" Then
+            ws.Delete
+            n = n + 1
+        End If
+    Next ws
+    Application.DisplayAlerts = True
+    MsgBox n & " feuille(s) x… supprimée(s).", vbInformation
+End Sub
+
+Public Sub DeletePlotSheets()
+    Dim ws As Worksheet, n As Long
+    Application.DisplayAlerts = False
+    For Each ws In ThisWorkbook.Worksheets
+        If Left$(ws.name, 5) = "PLOT_" Then
+            ws.Delete
+            n = n + 1
+        End If
+    Next ws
+    Application.DisplayAlerts = True
+    MsgBox n & " feuille(s) PLOT_* supprimée(s).", vbInformation
+End Sub
+
+Public Sub DeletePlotGrid()
+    Application.DisplayAlerts = False
+    On Error Resume Next
+    Worksheets("PLOTS_X_GRID").Delete
+    If Err.Number = 0 Then
+        MsgBox "PLOTS_X_GRID supprimée.", vbInformation
+    Else
+        MsgBox "PLOTS_X_GRID introuvable.", vbExclamation
+        Err.Clear
+    End If
+    Application.DisplayAlerts = True
+End Sub
+
+'========================
+' Tri par odeur 1 onglet/odeur
+'========================
+'--- remplace l’ancienne ---
+Private Function FindHeaderColumnStrict(ByVal ws As Worksheet, ByVal headerName As String) As Long
+    ' Recherche EXACTE de l’en-tête (insensible casse), ignore les colonnes "UNIT:*"
+    Dim lastCol As Long, c As Long, h As String
+    FindHeaderColumnStrict = 0
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    For c = 2 To lastCol
+        h = Trim$(CStr(ws.Cells(1, c).Value))
+        If Len(h) > 0 And Left$(UCase$(h), 5) <> "UNIT:" Then
+            If StrComp(h, headerName, vbTextCompare) = 0 Then
+                FindHeaderColumnStrict = c
+                Exit Function
+            End If
+        End If
+    Next c
+End Function
+
+'--- remplace l’ancienne ---
+Public Sub TriParOdeur()
+    Dim orderList As Collection, od As Variant
+    Dim ws As Worksheet, xSheets As New Collection
+    Dim seen As Object: Set seen = CreateObject("Scripting.Dictionary")
+    Dim i As Long
+
+    ' 1) charge l’ordre
+    Set orderList = LoadDesiredOrderList()
+    If orderList Is Nothing Or orderList.Count = 0 Then
+        MsgBox "Impossible de charger 'Ordre_Liste'.", vbExclamation
+        Exit Sub
+    End If
+
+    ' 2) liste UNIQUE des feuilles x…
+    For Each ws In ThisWorkbook.Worksheets
+        If Left$(ws.name, 1) = "x" And LCase$(CStr(ws.Cells(1, 1).Value)) = "time" Then
+            If Not seen.Exists(ws.name) Then
+                seen.Add ws.name, True
+                xSheets.Add ws
+            End If
+        End If
+    Next ws
+    If xSheets.Count = 0 Then
+        MsgBox "Aucune feuille 'x…' trouvée.", vbExclamation
+        Exit Sub
+    End If
+
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+
+    ' 3) pour chaque odeur -> 1 feuille, 1 colonne par x-feuille (pas plus)
+    Dim odorName As String, wsOdeur As Worksheet
+    Dim donor As Worksheet, donorCol As Long, lastRow As Long
+    Dim timeArr As Variant, outArr() As Variant
+    Dim r As Long, cOut As Long
+
+    For Each od In orderList
+        odorName = Trim$(CStr(od))
+        If Len(odorName) = 0 Then GoTo nextOdor
+
+        ' 3a) trouve un donneur pour récupérer TIME
+        Set donor = Nothing: donorCol = 0
+        For i = 1 To xSheets.Count
+            donorCol = FindHeaderColumnStrict(xSheets(i), odorName)
+            If donorCol > 0 Then Set donor = xSheets(i): Exit For
+        Next i
+        If donor Is Nothing Then GoTo nextOdor
+
+        lastRow = donor.Cells(donor.Rows.Count, 1).End(xlUp).Row
+        timeArr = donor.Range(donor.Cells(1, 1), donor.Cells(lastRow, 1)).Value  ' inclut entête "time"
+
+        ' 3b) prépare la feuille-odeur (vider/Créer après les x-feuilles)
+        Dim shName As String: shName = CleanSheetName(odorName)
+        On Error Resume Next
+        If SheetExists(shName) Then
+            Set wsOdeur = Worksheets(shName)
+            wsOdeur.Cells.Clear
+        Else
+            Dim afterIdx As Long: afterIdx = 0
+            For i = 1 To ThisWorkbook.Worksheets.Count
+                If Left$(Worksheets(i).name, 1) = "x" Then afterIdx = i
+            Next i
+            If afterIdx > 0 Then
+                Set wsOdeur = Worksheets.Add(After:=Worksheets(afterIdx))
+            Else
+                Set wsOdeur = Worksheets.Add(After:=Worksheets(Worksheets.Count))
+            End If
+            wsOdeur.name = shName
+        End If
+        On Error GoTo 0
+
+        ' 3c) dimensionne sortie : lignes = timeArr, colonnes = 1 (time) + nb x-feuilles
+        ReDim outArr(1 To UBound(timeArr, 1), 1 To xSheets.Count + 1)
+
+        ' time (copie tel quel, ligne 1 = "time")
+        For r = 1 To UBound(timeArr, 1)
+            outArr(r, 1) = timeArr(r, 1)
+        Next r
+
+        ' entêtes colonnes x-feuilles
+        cOut = 2
+        For i = 1 To xSheets.Count
+            outArr(1, cOut) = xSheets(i).name
+            cOut = cOut + 1
+        Next i
+
+        ' 3d) pour chaque x-feuille, si elle a la colonne odeur -> copie ses valeurs sous son entête
+        Dim valArr As Variant, haveCol As Long
+        cOut = 2
+        For i = 1 To xSheets.Count
+            haveCol = FindHeaderColumnStrict(xSheets(i), odorName)
+            If haveCol > 0 Then
+                valArr = xSheets(i).Range(xSheets(i).Cells(1, haveCol), xSheets(i).Cells(lastRow, haveCol)).Value ' inclut l’entête (ligne 1)
+                For r = 2 To UBound(timeArr, 1) ' on commence à 2 pour laisser l’entête sur la 1re ligne
+                    If r <= UBound(valArr, 1) Then
+                        outArr(r, cOut) = valArr(r, 1)
+                    Else
+                        outArr(r, cOut) = Empty
+                    End If
+                Next r
+            Else
+                ' pas cette odeur dans cette x-feuille ? colonne vide (entête déjà posé)
+            End If
+            cOut = cOut + 1
+        Next i
+
+        ' 3e) écriture + format
+        wsOdeur.Range(wsOdeur.Cells(1, 1), wsOdeur.Cells(UBound(outArr, 1), UBound(outArr, 2))).Value = outArr
+        wsOdeur.Rows(1).Font.Bold = True
+        wsOdeur.Columns.AutoFit
+
+nextOdor:
+    Next od
+
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+    MsgBox "Tri par odeur refait : 1 colonne par individu.", vbInformation
+End Sub
+
+
+
+'========================
+' Trouver la bonne colonne odeur
+'========================
+Private Function FindHeaderColumn(ByVal ws As Worksheet, ByVal headerName As String) As Long
+    ' Renvoie l’index de colonne où l’entête = headerName (insensible à la casse, ignore "UNIT:")
+    Dim lastCol As Long, c As Long, h As String
+    FindHeaderColumn = 0
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    For c = 2 To lastCol
+        h = Trim$(CStr(ws.Cells(1, c).Value))
+        If Len(h) > 0 And Left$(UCase$(h), 5) <> "UNIT:" Then
+            If StrComp(h, headerName, vbTextCompare) = 0 Then
+                FindHeaderColumn = c
+                Exit Function
+            End If
+        End If
+    Next c
+End Function
+
+
+'========================
+' Supprimer les feuilles odeurs
+'========================
+Public Sub DeleteOdeurSheets()
+    ' Supprime tous les onglets dont le nom correspond à une entrée d'Ordre_Liste
+    Dim orderList As Collection, od As Variant
+    Dim ws As Worksheet, target As String, n As Long
+
+    Set orderList = LoadDesiredOrderList()
+    If orderList Is Nothing Or orderList.Count = 0 Then
+        MsgBox "Impossible de charger 'Ordre_Liste' (feuille ou fichier Ordre_Liste.xlsx).", vbExclamation
+        Exit Sub
+    End If
+
+    Application.DisplayAlerts = False
+    For Each od In orderList
+        target = CleanSheetName(Trim$(CStr(od)))
+        If Len(target) > 0 Then
+            On Error Resume Next
+            If SheetExists(target) Then
+                Worksheets(target).Delete
+                If Err.Number = 0 Then n = n + 1 Else Err.Clear
+            End If
+            On Error GoTo 0
+        End If
+    Next od
+    Application.DisplayAlerts = True
+
+    MsgBox n & " onglet(s) d’odeur supprimé(s).", vbInformation
+End Sub
+
+'========================
+' Supprimer les feuilles brutes
+'========================
+Private Function IsBaseDataSheet(ws As Worksheet) As Boolean
+    ' Feuille de données brute : a "time" en A1, n’est PAS x…, ni PLOT_*, ni les feuilles système.
+    Dim nm As String: nm = ws.name
+    If LCase$(CStr(ws.Cells(1, 1).Value)) <> "time" Then IsBaseDataSheet = False: Exit Function
+    If nm = "TABLEAU_DE_BORD" Or nm = "LOG" Or nm = "PALETTE" Then IsBaseDataSheet = False: Exit Function
+    If Left$(nm, 1) = "x" Then IsBaseDataSheet = False: Exit Function
+    If Left$(nm, 5) = "PLOT_" Then IsBaseDataSheet = False: Exit Function
+    If nm = "PLOTS_X_GRID" Then IsBaseDataSheet = False: Exit Function
+    ' Exclut aussi les onglets d’odeur (noms présents dans Ordre_Liste)
+    Dim ol As Collection, od As Variant, cleaned As String
+    Set ol = LoadDesiredOrderList()
+    If Not (ol Is Nothing) And ol.Count > 0 Then
+        For Each od In ol
+            cleaned = CleanSheetName(Trim$(CStr(od)))
+            If StrComp(nm, cleaned, vbTextCompare) = 0 Then
+                IsBaseDataSheet = False
+                Exit Function
+            End If
+        Next od
+    End If
+    IsBaseDataSheet = True
+End Function
+
+Public Sub DeleteBaseDataSheets()
+    Dim ws As Worksheet, n As Long
+    Application.DisplayAlerts = False
+    For Each ws In ThisWorkbook.Worksheets
+        If IsBaseDataSheet(ws) Then
+            ws.Delete
+            n = n + 1
+        End If
+    Next ws
+    Application.DisplayAlerts = True
+    MsgBox n & " feuille(s) importée(s) (brutes) supprimée(s).", vbInformation
+End Sub
+
+'========================
+' Feuille calcul reponse
+'========================
+Public Sub OpenAnalyse()
+    ' Crée/rafraîchit "Calcul_Reponse" avec un tableau de paramètres bien visible
+    Dim ws As Worksheet, s As Shape, btn As Shape
+    If SheetExists("Calcul_Reponse") Then
+        Set ws = Worksheets("Calcul_Reponse")
+        ws.Cells.Clear
+        On Error Resume Next
+        For Each s In ws.Shapes: s.Delete: Next
+        On Error GoTo 0
+    Else
+        Set ws = Worksheets.Add(After:=Worksheets(Worksheets.Count))
+        ws.name = "Calcul_Reponse"
+    End If
+
+    With ws
+        .Cells.Interior.Color = RGB(255, 255, 255)
+        .Cells.Font.name = "Calibri Light"
+        .Cells.Font.Size = 11
+        .Columns("A:K").ColumnWidth = 20
+    End With
+
+    ' Titre & instructions
+    ws.Range("A1").Value = "Calcul des réponses (Mesurée - Basale)"
+    With ws.Range("A1"): .Font.Size = 16: .Font.Bold = True: End With
+    ws.Range("A3").Value = "Paramètres :"
+    ws.Range("A4").Value = "• Valeur basale : temps en secondes (ex : 2,50)"
+    ws.Range("A5").Value = "• Valeur mesurée : temps en secondes (ex : 3,00) OU 'max' (minimum de la courbe = valeur négative maximale)"
+
+    ' Tableau des paramètres (B7:E8)
+    ws.Range("B7").Value = "Valeur basale (s)"
+    ws.Range("B8").Value = "Valeur mesurée (s ou 'max')"
+    ws.Range("E7").Value = 2.5
+    ws.Range("E8").Value = "max"
+    ws.Range("B7:B8").Font.Bold = True
+
+    ' Quadrillage net
+    With ws.Range("B7:E8").Borders
+        .LineStyle = xlContinuous
+        .Weight = xlThin
+        .Color = RGB(0, 0, 0)
+    End With
+    ' Met en avant les cellules de saisie
+    With ws.Range("E7:E8")
+        .Interior.Color = RGB(255, 255, 204) ' jaune très clair
+        .Font.Bold = True
+    End With
+
+    ' Bouton Calcul — PLUS BAS
+    Set btn = ws.Shapes.AddShape(msoShapeRoundedRectangle, 380, 170, 180, 38)
+    With btn
+        .TextFrame2.TextRange.text = "Calcul"
+        .OnAction = "RunAnalyse"
+        .Fill.ForeColor.RGB = RGB(0, 176, 80)
+        .line.ForeColor.RGB = RGB(0, 97, 0)
+        .TextFrame2.TextRange.Font.name = "Calibri Light"
+        .TextFrame2.TextRange.Font.Size = 14
+        .TextFrame2.TextRange.Font.Fill.ForeColor.RGB = RGB(0, 0, 0)
+    End With
+
+    ' Bouton Résumé + Heatmap
+    Set btn = ws.Shapes.AddShape(msoShapeRoundedRectangle, 580, 170, 220, 38)
+    With btn
+        .TextFrame2.TextRange.text = "Résumé + Carte de chaleur"
+        .OnAction = "SummarizeAndHeatmap"
+        .Fill.ForeColor.RGB = RGB(255, 215, 0)
+        .line.ForeColor.RGB = RGB(204, 153, 0)
+        .TextFrame2.TextRange.Font.name = "Calibri Light"
+        .TextFrame2.TextRange.Font.Size = 12
+        .TextFrame2.TextRange.Font.Fill.ForeColor.RGB = RGB(0, 0, 0)
+    End With
+
+    ' Bouton Export CSV
+    Set btn = ws.Shapes.AddShape(msoShapeRoundedRectangle, 830, 170, 180, 38)
+    With btn
+        .TextFrame2.TextRange.text = "Exporter en CSV"
+        .OnAction = "ExportCalculReponseCsv"
+        .Fill.ForeColor.RGB = RGB(0, 176, 80)
+        .line.ForeColor.RGB = RGB(0, 97, 0)
+        .TextFrame2.TextRange.Font.name = "Calibri Light"
+        .TextFrame2.TextRange.Font.Size = 12
+        .TextFrame2.TextRange.Font.Fill.ForeColor.RGB = RGB(0, 0, 0)
+    End With
+ws.Range("A11").Value = "Résultats : lignes = individus, colonnes = odeurs (Ordre_Liste)"
+ws.Range("A11").Font.Bold = True
+' Place l'indication 2 lignes au-dessus de la vraie table
+ws.Rows(RESULTS_HEADER_ROW - 2).EntireRow.Cells(1, 1).Value = ws.Range("A11").Value
+ws.Rows(RESULTS_HEADER_ROW - 2).Font.Bold = True
+ws.Range("A11").ClearContents
+End Sub
+
+
+'========================
+' Ordonne les réponses en fonction de Ordre_Liste
+'========================
+Public Sub RunAnalyse()
+    On Error GoTo fail_soft
+    If Not SheetExists("Calcul_Reponse") Then
+        MsgBox "Ouvre d'abord la page via le bouton 'Analyse'.", vbExclamation: Exit Sub
+    End If
+    Dim wsOut As Worksheet: Set wsOut = Worksheets("Calcul_Reponse")
+
+    ' --- paramètres (inchangé) ---
+    Dim baseT As Variant, measT As Variant, useMax As Boolean
+    baseT = ParseDoubleFr(CStr(wsOut.Range("E7").Value))
+    measT = wsOut.Range("E8").Value
+    If IsEmpty(baseT) Then MsgBox "Temps basale invalide (E7). Exemple : 2,50", vbExclamation: Exit Sub
+    If VarType(measT) = vbString Then
+        If LCase$(Trim$(CStr(measT))) = "max" Then useMax = True _
+        Else measT = ParseDoubleFr(CStr(measT)): If IsEmpty(measT) Then MsgBox "Valeur mesurée invalide (E8).", vbExclamation: Exit Sub
+    Else
+        measT = ParseDoubleFr(CStr(measT)): If IsEmpty(measT) Then MsgBox "Valeur mesurée invalide (E8).", vbExclamation: Exit Sub
+    End If
+
+    Dim orderList As Collection: Set orderList = LoadDesiredOrderList()
+    If orderList Is Nothing Or orderList.Count = 0 Then MsgBox "Impossible de charger 'Ordre_Liste'.", vbExclamation: Exit Sub
+
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+
+    ' --- efface ancien tableau à partir de RESULTS_HEADER_ROW ---
+    Dim lastCol As Long, lastRow As Long
+    lastCol = wsOut.Cells(RESULTS_HEADER_ROW, wsOut.Columns.Count).End(xlToLeft).Column
+    If lastCol < 1 Then lastCol = 1
+    lastRow = wsOut.Cells(wsOut.Rows.Count, 1).End(xlUp).Row
+    If lastRow < RESULTS_HEADER_ROW Then lastRow = RESULTS_HEADER_ROW
+    wsOut.Range(wsOut.Cells(RESULTS_HEADER_ROW, 1), wsOut.Cells(lastRow, lastCol)).ClearContents
+
+    ' --- en-têtes ---
+    Dim rowHeader As Long: rowHeader = RESULTS_HEADER_ROW
+    Dim colStart As Long: colStart = 1
+    wsOut.Cells(rowHeader, colStart).Value = "Individu"
+
+    Dim colMap As Object: Set colMap = CreateObject("Scripting.Dictionary")
+    Dim od As Variant, cOut As Long: cOut = colStart + 1
+    For Each od In orderList
+        wsOut.Cells(rowHeader, cOut).Value = CStr(od)
+        colMap(CStr(od)) = cOut
+        cOut = cOut + 1
+    Next od
+
+    ' --- calculs (inchangé dans l’esprit) ---
+    Dim rowMap As Object: Set rowMap = CreateObject("Scripting.Dictionary")
+    Dim nextRow As Long: nextRow = rowHeader + 1
+
+    Dim odorName As String, wsOd As Worksheet
+    For Each od In orderList
+        odorName = Trim$(CStr(od))
+        If Len(odorName) = 0 Then GoTo nextOdor
+        If Not SheetExists(CleanSheetName(odorName)) Then GoTo nextOdor
+
+        Set wsOd = Worksheets(CleanSheetName(odorName))
+        Dim lastRowOd As Long, lastColOd As Long
+        lastRowOd = wsOd.Cells(wsOd.Rows.Count, 1).End(xlUp).Row
+        lastColOd = wsOd.Cells(1, wsOd.Columns.Count).End(xlToLeft).Column
+        If lastRowOd < 2 Or lastColOd < 2 Then GoTo nextOdor
+
+        Dim tArr As Variant: tArr = wsOd.Range(wsOd.Cells(2, 1), wsOd.Cells(lastRowOd, 1)).Value
+        Dim c As Long
+        For c = 2 To lastColOd
+            Dim indiv As String: indiv = CStr(wsOd.Cells(1, c).Value)
+            If Len(Trim$(indiv)) = 0 Then GoTo nextC
+            Dim vArr As Variant: vArr = wsOd.Range(wsOd.Cells(2, c), wsOd.Cells(lastRowOd, c)).Value
+
+            Dim v0 As Variant, v1 As Variant, res As Variant
+            v0 = ValueAtTimeFromArrays(tArr, vArr, CDbl(baseT))
+            If useMax Then v1 = ColumnMinFromArray(vArr) Else v1 = ValueAtTimeFromArrays(tArr, vArr, CDbl(measT))
+            If Not (IsEmpty(v0) Or IsEmpty(v1)) Then
+                res = CDbl(v1) - CDbl(v0)
+                If Not rowMap.Exists(indiv) Then
+                    rowMap.Add indiv, nextRow
+                    wsOut.Cells(nextRow, colStart).Value = indiv
+                    nextRow = nextRow + 1
+                End If
+                wsOut.Cells(CLng(rowMap(indiv)), CLng(colMap(odorName))).Value = res
+            End If
+nextC:
+        Next c
+nextOdor:
+    Next od
+
+    wsOut.Rows(rowHeader).Font.Bold = True
+    wsOut.Columns.AutoFit
+
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+    MsgBox "Calcul terminé (Mesurée - Basale).", vbInformation
+    Exit Sub
+
+fail_soft:
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+    MsgBox "Oups : " & Err.Description, vbExclamation
+End Sub
+
+
+Private Function ParseDoubleFr(ByVal s As Variant) As Variant
+    ' Accepte 2,5 ou 2.5, valeurs numériques directes, gère espaces / NBSP
+    If IsNumeric(s) Then
+        ParseDoubleFr = CDbl(s)
+        Exit Function
+    End If
+    
+    Dim t As String
+    t = Trim$(CStr(s))
+    If Len(t) = 0 Then ParseDoubleFr = Empty: Exit Function
+    
+    t = Replace(t, Chr(160), "")  ' espace insécable
+    t = Replace(t, " ", "")       ' espaces
+    t = Replace(t, ",", ".")      ' virgule -> point (pour Val)
+    
+    On Error Resume Next
+    ParseDoubleFr = val(t)        ' Val comprend toujours le point comme décimale
+    If Err.Number <> 0 Then
+        ParseDoubleFr = Empty
+        Err.Clear
+    End If
+    On Error GoTo 0
+End Function
+
+
+Private Function ValueAtTimeFromArrays(ByVal tArr As Variant, ByVal vArr As Variant, ByVal targetT As Double) As Variant
+    ' Retourne v au temps le plus proche de targetT, en tolérant des longueurs différentes
+    Dim nT As Long, nV As Long, i As Long, bestIdx As Long, bestDist As Double, t As Double
+    nT = UBound(tArr, 1): nV = UBound(vArr, 1)
+    bestIdx = -1: bestDist = 1E+99
+    For i = 1 To nT
+        If IsNumeric(tArr(i, 1)) Then
+            t = CDbl(tArr(i, 1))
+            If Abs(t - targetT) < bestDist Then
+                bestDist = Abs(t - targetT)
+                bestIdx = i
+            End If
+        End If
+    Next i
+    If bestIdx = -1 Or bestIdx > nV Then
+        ValueAtTimeFromArrays = Empty
+    ElseIf IsNumeric(vArr(bestIdx, 1)) Then
+        ValueAtTimeFromArrays = CDbl(vArr(bestIdx, 1))
+    Else
+        ValueAtTimeFromArrays = Empty
+    End If
+End Function
+
+Private Function ColumnMinFromArray(ByVal vArr As Variant) As Variant
+    ' Minimum numérique (la "valeur négative maximale" si les valeurs sont négatives)
+    Dim n As Long, i As Long, v As Variant, m As Double, hasVal As Boolean
+    n = UBound(vArr, 1)
+    For i = 1 To n
+        v = vArr(i, 1)
+        If IsNumeric(v) Then
+            If Not hasVal Then m = CDbl(v): hasVal = True _
+            Else If CDbl(v) < m Then m = CDbl(v)
+        End If
+    Next i
+    If hasVal Then ColumnMinFromArray = m Else ColumnMinFromArray = Empty
+End Function
+
+'========================
+' Résumé et heatmap
+'========================
+Public Sub SummarizeAndHeatmap()
+    If Not SheetExists("Calcul_Reponse") Then
+        MsgBox "Ouvre d'abord 'Calcul_Reponse' via le bouton Analyse.", vbExclamation
+        Exit Sub
+    End If
+    
+    Dim ws As Worksheet: Set ws = Worksheets("Calcul_Reponse")
+
+    Dim rowHeader As Long: rowHeader = RESULTS_HEADER_ROW   ' ex: 22
+    Dim colStart As Long: colStart = 1                      ' A = "Individu"
+
+    ' bornes colonnes/lignes
+    Dim lastCol As Long, firstDataRow As Long, lastDataRow As Long
+    lastCol = ws.Cells(rowHeader, ws.Columns.Count).End(xlToLeft).Column
+    If lastCol <= colStart Then
+        MsgBox "Aucun résultat à résumer (lance Calcul).", vbExclamation
+        Exit Sub
+    End If
+    
+    firstDataRow = rowHeader + 1
+    lastDataRow = ws.Cells(ws.Rows.Count, colStart).End(xlUp).Row
+    If lastDataRow < firstDataRow Then
+        MsgBox "Aucune donnée trouvée.", vbExclamation
+        Exit Sub
+    End If
+
+    Application.ScreenUpdating = False
+
+    ' --- nettoie anciens résumés sous les données ---
+    ws.Rows((lastDataRow + 1) & ":" & (lastDataRow + 5)).ClearContents
+
+    ' --- crée lignes résumé ---
+    Dim rowMean As Long, rowStd As Long
+    rowMean = lastDataRow + 1
+    rowStd = lastDataRow + 2
+    
+    ws.Cells(rowMean, colStart).Value = "Moyenne"
+    ws.Cells(rowStd, colStart).Value = "Écart-type"
+    ws.Rows(rowMean).Font.Bold = True
+    ws.Rows(rowStd).Font.Bold = True
+
+    Dim c As Long
+    For c = colStart + 1 To lastCol
+        ' Formules FR. (Si un jour Excel EN, faudra remplacer par Formula = "=AVERAGE(...)" etc.)
+        ws.Cells(rowMean, c).FormulaLocal = "=MOYENNE(" & _
+            ws.Cells(firstDataRow, c).Address(False, False) & ":" & _
+            ws.Cells(lastDataRow, c).Address(False, False) & ")"
+        
+        ws.Cells(rowStd, c).FormulaLocal = "=ECARTYPE.STANDARD(" & _
+            ws.Cells(firstDataRow, c).Address(False, False) & ":" & _
+            ws.Cells(lastDataRow, c).Address(False, False) & ")"
+    Next c
+
+    ' --- mise en forme numérique (données + moyennes/SD) ---
+    ws.Range(ws.Cells(firstDataRow, colStart + 1), ws.Cells(rowStd, lastCol)).NumberFormat = "0.000"
+
+    ' === HEATMAP PAR LIGNE ===
+       ' === HEATMAP PAR LIGNE (vert -> jaune -> rouge) ===
+    ' Pour chaque individu (chaque ligne),
+    ' on applique un dégradé 3 couleurs :
+    '   - max de la ligne  -> vert (réponse faible)
+    '   - milieu (50%)    -> jaune
+    '   - min de la ligne -> rouge (réponse forte/négative)
+
+    Dim r As Long
+    Dim rngRow As Range
+    Dim cs As ColorScale
+
+    For r = firstDataRow To lastDataRow
+        Set rngRow = ws.Range(ws.Cells(r, colStart + 1), ws.Cells(r, lastCol))
+
+        ' Vérifie qu'il y a au moins une valeur numérique
+        If Application.WorksheetFunction.Count(rngRow) > 0 Then
+            On Error Resume Next
+            rngRow.FormatConditions.Delete
+            On Error GoTo 0
+
+            ' Échelle de couleur 3 points : vert -> jaune -> rouge
+            Set cs = rngRow.FormatConditions.AddColorScale(ColorScaleType:=3)
+
+            ' 1?? Minimum = rouge (valeur la plus basse, réponse forte)
+            With cs.ColorScaleCriteria(1)
+                .Type = xlConditionValueLowestValue
+                .FormatColor.Color = RGB(255, 0, 0)
+            End With
+
+            ' 2?? Milieu = jaune
+            With cs.ColorScaleCriteria(2)
+                .Type = xlConditionValuePercentile
+                .Value = 50
+                .FormatColor.Color = RGB(255, 255, 0)
+            End With
+
+            ' 3?? Maximum = vert
+            With cs.ColorScaleCriteria(3)
+                .Type = xlConditionValueHighestValue
+                .FormatColor.Color = RGB(0, 176, 80)
+            End With
+        End If
+    Next r
+
+    ws.Columns.AutoFit
+    Application.ScreenUpdating = True
+    MsgBox "Résumé OK + Heatmap par individu appliquée (rouge = réponse la plus négative).", vbInformation
+End Sub
+'===========================
+' SUPPRIMER FEUILLE CALCUL_REPONSE
+'===========================
+Public Sub DeleteCalculResponse()
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets("Calcul_Reponse")
+    On Error GoTo 0
+
+    If ws Is Nothing Then
+        MsgBox "La feuille 'Calcul_Reponse' n'existe pas.", vbInformation
+    Else
+        If MsgBox("Supprimer la feuille 'Calcul_Reponse' ?", vbQuestion + vbYesNo, "Confirmation") = vbYes Then
+            Application.DisplayAlerts = False
+            ws.Delete
+            Application.DisplayAlerts = True
+            MsgBox "Feuille 'Calcul_Reponse' supprimée.", vbInformation
+        End If
+    End If
+End Sub
+
+
+
+
