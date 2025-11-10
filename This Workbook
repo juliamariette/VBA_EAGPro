@@ -1,0 +1,28 @@
+Private Sub Workbook_Open()
+    On Error Resume Next
+
+    '=== petit message d'accueil ===
+    Application.StatusBar = "Bienvenue ! Création du tableau de bord en cours..."
+    MsgBox "Bienvenue dans ton fichier d'analyse EAG." & vbCrLf & _
+           "Le tableau de bord va se (re)créer automatiquement.", vbInformation, "Chargement..."
+
+    '=== création ou mise à jour du dashboard ===
+    Call setupdashboard
+
+    '=== nettoyage et mise en forme ===
+    Worksheets("TABLEAU_DE_BORD").Activate
+    ActiveWindow.DisplayGridlines = False
+    Application.StatusBar = False
+
+    '=== cacher les feuilles techniques ===
+    On Error Resume Next
+    Worksheets("PALETTE").visible = xlSheetHidden
+    Worksheets("LOG").visible = xlSheetHidden
+    On Error GoTo 0
+
+    '=== message final ===
+    MsgBox "Tableau de bord prêt" & vbCrLf & _
+           "Utilise les boutons pour charger, convertir et tracer tes données.", _
+           vbInformation, "EAG Analyses"
+End Sub
+
